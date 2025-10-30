@@ -20,14 +20,17 @@ import os
 import time
 import math
 import pickle
+import json
 from contextlib import nullcontext
+from transformers import AutoTokenizer
+from transformers import GPT2Tokenizer
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model1 import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -44,7 +47,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'enwik8'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -69,14 +72,24 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+print("device:", device)
+eval_splits = 'train,val'
+final_test = True
+
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+block_variant = globals().get('block_variant')  # 'standard' | 'multiscale' | 'memory'
+pos_encoding = globals().get('pos_encoding')
+rope_learned_base=globals().get('rope_learned_base')
+use_ngram_adapter=globals().get('use_ngram_adapter')
+loss_variant=globals().get('loss_variant')
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -113,22 +126,46 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
+# Initialize the tokenizer (do this once, outside the function)
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.pad_token = tokenizer.eos_token  # GPT2 doesn't have a pad token by default
+
+def _load_dtype(data_dir: str) -> np.dtype:
+    meta_path = os.path.join(data_dir, "meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return np.dtype(meta.get("dtype", "uint16"))
+    # 後方互換（meta が無いなら従来どおり uint16 前提）
+    return np.dtype("uint16")
+
+SPLIT2BIN = {'train': 'train', 'val': 'valid', 'valid': 'valid', 'test': 'test'}
+
+def get_batch(split: str):
+    """
+    从 data/<dataset>/{train|valid|test}.bin 采样一个 batch。
+    支持 split: 'train', 'val', 'valid', 'test'（'val' 与 'valid' 等价）。
+    """
+    dtype = _load_dtype(data_dir)
+
+    key = SPLIT2BIN.get(split)
+    assert key is not None, f"unknown split={split!r}. expected one of {list(SPLIT2BIN)}"
+
+    data = np.memmap(os.path.join(data_dir, f'{key}.bin'), dtype=dtype, mode='r')
+
+    assert len(data) > block_size, f"{split}.bin 太短（len={len(data)} <= block_size={block_size}）"
+
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    x = torch.stack([torch.from_numpy(np.asarray(data[i:i+block_size], dtype=np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(np.asarray(data[i+1:i+1+block_size], dtype=np.int64)) for i in ix])
+
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
+
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -144,8 +181,19 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+    bias=bias, vocab_size=None, dropout=dropout,
+
+    # ---- new switches ----
+    pos_encoding=globals().get('pos_encoding', 'abs'),   # configs for GPT variants
+    rope_fraction=globals().get('rope_fraction', 1.0),
+    rope_learned_base=globals().get('rope_learned_base', False),
+
+    use_ngram_adapter=globals().get('use_ngram_adapter', False),
+    ngram_kernel_sizes=globals().get('ngram_kernel_sizes', (2,3,4)),
+)    # start with model_args from command line
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -158,7 +206,14 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    if rope_learned_base==True and use_ngram_adapter==True:
+        ckpt_path = os.path.join(out_dir, f'ckpt-{pos_encoding}-rope_learned_base-ngram_adapter.pt')
+    elif rope_learned_base==True:
+        ckpt_path = os.path.join(out_dir, f'ckpt-{pos_encoding}-rope_learned_base.pt')
+    elif use_ngram_adapter==True:
+        ckpt_path = os.path.join(out_dir, f'ckpt-{pos_encoding}-ngram_adapter.pt')
+    else:
+        ckpt_path = os.path.join(out_dir, f'ckpt-{pos_encoding}.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -213,19 +268,24 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(splits=None):
+    if splits is None:
+        splits = tuple(s.strip() for s in eval_splits.split(',') if s.strip())
+
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in splits:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
-        out[split] = losses.mean()
+        mean_loss = losses.mean().item()
+        out[split] = {'loss': mean_loss, 'bpc': mean_loss / math.log(2)}
     model.train()
     return out
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -248,10 +308,12 @@ if wandb_log and master_process:
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
+# X, Y = get_batch('train', AutoTokenizer.from_pretrained('gpt2')) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+test_path = os.path.join(data_dir, 'test.bin')
 while True:
 
     # determine and set the learning rate for this iteration
@@ -261,18 +323,26 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        metrics = estimate_loss(('test',))
+        print(f"test loss {metrics['test']['loss']:.6f}, test bpc {metrics['test']['bpc']:.6f}")
+        metrics = estimate_loss()  # 使用全局 eval_splits
+        msg = f"step {iter_num}: " + ", ".join(
+            f"{s} loss {metrics[s]['loss']:.6f} bpc {metrics[s]['bpc']:.6f}" for s in metrics
+        )
+        print(msg)
+        print(f'lr {lr:.6f}')
+
         if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+            log = {"iter": iter_num, "lr": lr, "mfu": running_mfu*100}
+            for s in metrics:
+                log[f"{s}/loss"] = metrics[s]['loss']
+                log[f"{s}/bpc"]  = metrics[s]['bpc']
+            wandb.log(log)
+
+        ckpt_split = 'val' if 'val' in metrics else ('valid' if 'valid' in metrics else 'train')
+        current_val = metrics[ckpt_split]['loss']
+        if current_val < best_val_loss or always_save_checkpoint:
+            best_val_loss = current_val
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -283,7 +353,15 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if rope_learned_base==True and use_ngram_adapter==True:
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{pos_encoding}-rope_learned_base-ngram_adapter.pt'))
+                elif rope_learned_base==True:
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{pos_encoding}-rope_learned_base.pt'))
+                elif use_ngram_adapter==True:
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{pos_encoding}-ngram_adapter.pt'))
+                else:
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{pos_encoding}.pt'))
+
     if iter_num == 0 and eval_only:
         break
 
@@ -324,7 +402,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
@@ -334,3 +412,10 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+# final one-time test evaluation
+if master_process and final_test:
+    test_path = os.path.join(data_dir, 'test.bin')
+    if os.path.exists(test_path):
+        metrics = estimate_loss(('test',))
+        print(f"FINAL test loss {metrics['test']['loss']:.6f}, test bpc {metrics['test']['bpc']:.6f}")
