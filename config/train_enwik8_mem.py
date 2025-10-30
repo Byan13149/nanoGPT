@@ -25,8 +25,8 @@ n_embd = 384
 dropout = 0.2
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 1200000
-lr_decay_iters = 1200000 # make equal to max_iters usually
+max_iters = 300000
+lr_decay_iters = 300000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
@@ -36,7 +36,7 @@ warmup_iters = 100 # not super necessary potentially
 # device = 'cpu'  # run on cpu only
 # compile = False # do not torch compile the model
 
-block_variant: str = 'standard'       # 'standard' | 'memory'
+block_variant: str = 'memory'       # 'standard' | 'memory'
 memory_size: int = 128                # for memory
 expert_capacity: float = 0.25         # (placeholder)
 

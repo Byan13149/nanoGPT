@@ -42,6 +42,6 @@ expert_capacity: float = 0.25         # (placeholder)
 
 init_from = 'scratch' # 'scratch' | 'resume' | 'gpt2*'
 
-pos_encoding='abs'  # 'abs' | 'rope' | 'adaptive_rope'
+pos_encoding='rope'  # 'abs' | 'rope' | 'adaptive_rope'
 rope_learned_base=False
 use_ngram_adapter=False
