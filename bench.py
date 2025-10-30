@@ -78,7 +78,7 @@ if profile:
         with_stack=False, # incurs an additional overhead, disable if not needed
         with_flops=True,
         with_modules=False, # only for torchscript models atm
-    ) as prof:
+    ) as prof: 
 
         X, Y = get_batch('train')
         for k in range(num_steps):

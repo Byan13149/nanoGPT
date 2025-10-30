@@ -1,7 +1,7 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-shakespeare-char'
+out_dir = 'out-enwik8'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -10,10 +10,10 @@ log_interval = 10 # don't print too too often
 always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
-wandb_project = 'shakespeare-char'
+wandb_project = 'enwik8'
 wandb_run_name = 'mini-gpt'
 
-dataset = 'shakespeare_char'
+dataset = 'enwik8'
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters
@@ -25,8 +25,8 @@ n_embd = 384
 dropout = 0.2
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 5000
-lr_decay_iters = 5000 # make equal to max_iters usually
+max_iters = 1200000
+lr_decay_iters = 1200000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
@@ -35,3 +35,15 @@ warmup_iters = 100 # not super necessary potentially
 # on macbook also add
 # device = 'cpu'  # run on cpu only
 # compile = False # do not torch compile the model
+
+attention_type: str = 'full'          # 'full' | 'dynamic_sparse'
+block_variant: str = 'standard'       # 'standard' | 'multiscale' | 'memory'
+scale_factor: int = 2                 # for multiscale
+sparse_ratio: float = 0.3             # for dynamic_sparse
+tau: float = 0.5                      # for dynamic_sparse
+memory_size: int = 128                # for memory
+use_moe_mlp: bool = False             # replace MLP with MoE
+num_experts: int = 4                  # for MoE
+expert_capacity: float = 0.25         # (placeholder)
+
+init_from = 'scratch' # 'scratch' | 'resume' | 'gpt2*'
