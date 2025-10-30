@@ -16,11 +16,14 @@ This version adds several modules to `model.py`, including **RoPE** (and its var
    ***Standard NanoGPT***
    ```bash
    python train.py config/train_enwik8_std.py
+   ```
 
    ***Memory-enhanced NanoGPT***
    ```bash
    python train.py config/train_enwik8_mem.py
+   ```
 
    ***NanoGPT with RoPE***
    ```bash
    python train.py config/train_enwik8_rope.py
+   ```
