@@ -22,7 +22,7 @@ class RotaryEmbedding(nn.Module):
         assert 0.0 < fraction <= 1.0
         self.rotary_dim = int(head_dim * fraction) // 2 * 2  # even
         self.n_heads = n_heads
-        self.base = float(base)
+        self.base = float(base) 
         self.learned_base = bool(learned_base)
         if self.learned_base:
             # log-base per head -> base_h = exp(log_base_h)
