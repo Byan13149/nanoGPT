@@ -184,7 +184,7 @@ class CausalSelfAttention(nn.Module):
             )
             self.rope_gate = None
             if self.pos_encoding == 'adaptive_rope':
-                # 从序列平均表征生成每头缩放因子
+                # generate from the mean token representation
                 self.rope_gate = nn.Sequential(
                     LayerNorm(config.n_embd, bias=config.bias),
                     nn.Linear(config.n_embd, config.n_head)
@@ -204,7 +204,7 @@ class CausalSelfAttention(nn.Module):
         if self.rotary is not None:
             scale_per_head = None
             if self.rope_gate is not None:
-                # x: (B,T,C) -> 先对 T 做平均，得到 (B,C)，再经 LN+Linear -> (B,H)
+                # x: (B,T,C) -> Even out T to get (B,C), and then go through LN+Linear -> (B,H)
                 g = self.rope_gate(x.mean(dim=1)).sigmoid()   # (B,H)
                 scale_per_head = 0.5 + g
             else:
