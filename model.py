@@ -51,11 +51,16 @@ class RotaryEmbedding(nn.Module):
         pos = torch.arange(T, device=device, dtype=torch.float32)  # (T,)
         # angles: (H,T,D/2) → broadcast to (B,H,T,D/2)
         angles = inv.unsqueeze(1) * pos.view(1, T, 1)  # (H, T, D/2)
+        angles = angles.unsqueeze(0)                   # (1, H, T, D/2)
+
         if scale_per_head is not None:
-            # scale_per_head: (B,H) -> broadcast to (B,H,T,D/2)
-            angles = angles.unsqueeze(0) * scale_per_head.view(B, H, 1, 1).to(angles.dtype)
-        else:
-            angles = angles.unsqueeze(0)  # (1, H, T, D/2) → broadcasts to (B, H, T, D/2)
+            if scale_per_head.dim() == 2:              # (B,H)
+                scale = scale_per_head.view(B, H, 1, 1).to(angles.dtype)
+            elif scale_per_head.dim() == 3:            # (B,T,H)
+                scale = scale_per_head.permute(0, 2, 1).unsqueeze(-1).to(angles.dtype)  # (B,H,T,1)
+            else:
+                raise ValueError("scale_per_head must be (B,H) or (B,T,H)")
+            angles = angles * scale                    # broadcast to (B,H,T,D/2)
         cos = torch.cos(angles).to(q.dtype)
         sin = torch.sin(angles).to(q.dtype)
 
@@ -127,7 +132,7 @@ class MemoryEnhancedBlock(nn.Module):
         x_with_memory = x + gate * retrieved_memory
         return x_with_memory + self.mlp(self.ln_2(x_with_memory))
 
-# ------------------------- core layers (kept compatible) ---------------------
+# ------------------------- core layers ---------------------
 
 class LayerNorm(nn.Module):
     """LayerNorm with optional bias (nanoGPT style)"""
@@ -175,6 +180,9 @@ class CausalSelfAttention(nn.Module):
 
         self.head_dim = config.n_embd // config.n_head
         self.pos_encoding = getattr(config, 'pos_encoding', 'abs')
+        self.rope_alpha = float(getattr(config, 'rope_alpha', 1.0))        # 1.0 = full strength
+        self.rope_clamp = getattr(config, 'rope_clamp', (0.5, 1.5))        # None or (lo, hi)
+
         if self.pos_encoding in ('rope', 'adaptive_rope'):
             self.rotary = RotaryEmbedding(
                 head_dim=self.head_dim, n_heads=config.n_head,
@@ -184,11 +192,13 @@ class CausalSelfAttention(nn.Module):
             )
             self.rope_gate = None
             if self.pos_encoding == 'adaptive_rope':
-                # generate from the mean token representation
                 self.rope_gate = nn.Sequential(
                     LayerNorm(config.n_embd, bias=config.bias),
                     nn.Linear(config.n_embd, config.n_head)
                 )
+                # init gate to identity: sigmoid(0)=0.5 → scale = 1.0
+                nn.init.zeros_(self.rope_gate[-1].weight)
+                nn.init.zeros_(self.rope_gate[-1].bias)
         else:
             self.rotary = None
             self.rope_gate = None
@@ -197,18 +207,22 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)   # (B,H,T,D)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         if self.rotary is not None:
             scale_per_head = None
             if self.rope_gate is not None:
-                # x: (B,T,C) -> Even out T to get (B,C), and then go through LN+Linear -> (B,H)
-                g = self.rope_gate(x.mean(dim=1)).sigmoid()   # (B,H)
-                scale_per_head = 0.5 + g
-            else:
-                scale_per_head = None
+                # prefix-mean (causal) in fp32 for LN stability
+                lengths = torch.arange(1, T+1, device=x.device, dtype=torch.float32).view(1, T, 1)
+                prefix_mean = (x.cumsum(dim=1).to(torch.float32) / lengths)     # (B,T,C) fp32
+                g = self.rope_gate(prefix_mean).sigmoid()                        # (B,T,H) fp32
+                scale_per_head = (1.0 + self.rope_alpha * (g - 0.5))
+                if self.rope_clamp is not None:
+                    lo, hi = self.rope_clamp
+                    scale_per_head = scale_per_head.clamp(lo, hi)
+                scale_per_head = scale_per_head.to(x.dtype)
 
             q, k = self.rotary(q, k, scale_per_head=scale_per_head)
 
@@ -226,6 +240,7 @@ class CausalSelfAttention(nn.Module):
             y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
+
 
 
 class StandardBlock(nn.Module):
@@ -401,8 +416,7 @@ class GPT(nn.Module):
             raise ValueError("from_pretrained only supports vanilla model; do not override variant knobs here.")
         # force vanilla
         if 'dropout' in override_args:
-            pass  # ok
-        # defer to original logic below (copied from your file) -----------------
+            pass
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
